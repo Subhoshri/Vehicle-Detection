@@ -1,214 +1,152 @@
 import cv2
 import numpy as np
-import matplotlib.pyplot as plt
 
-# =========================================================
-# CONFIGURATION
-# =========================================================
-video_path = "/kaggle/input/vehant-vehicle-camera-dataset/Dataset/vehant_hackathon_video_1.avi"
+class Solution:
+    def __init__(self):
+        # Reference FPS used for normalization
+        self.REFERENCE_FPS = 20.0
 
-BASE_MAX_DISTANCE = 50
-NEAR_CAMERA_BOOST = 1.5
-MAX_MISSING = 10
+        # Detection & filtering parameters
+        self.MIN_AREA_RATIO = 0.0012
+        self.MIN_ASPECT_RATIO = 0.7
 
-MIN_AGE = 8
-MIN_MOVE = 15
+        # Tracking parameters (reference @ 20 FPS)
+        self.BASE_MAX_LIFESPAN_MISS = 15
+        self.BASE_MIN_AGE_TO_COUNT = 3
+        self.BASE_SEARCH_DIST_RATIO = 0.12
 
-COUNT_LINE_Y_RATIO = 0.6
-VIS_EVERY_N_FRAMES = 150
-EXIT_ZONE_Y_RATIO = 0.2   # top 20% of frame
+        # Counting line position
+        self.COUNT_LINE_Y_RATIO = 0.60
 
-# =========================================================
-# HELPERS
-# =========================================================
-def is_valid_vehicle(obj):
-    if obj["age"] < MIN_AGE:
-        return False
-    if len(obj["history"]) < 2:
-        return False
+    def forward(self, video_path: str) -> int:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return 0
 
-    x0, y0 = obj["history"][0]
-    x1, y1 = obj["history"][-1]
-    return np.hypot(x1 - x0, y1 - y0) >= MIN_MOVE
+        # Detect FPS
+        actual_fps = cap.get(cv2.CAP_PROP_FPS)
+        if actual_fps <= 0:
+            actual_fps = self.REFERENCE_FPS
 
+        fps_factor = actual_fps / self.REFERENCE_FPS
 
-def crossed_line(obj, line_y):
-    if len(obj["history"]) < 2:
-        return False
-    (_, prev_y) = obj["history"][-2]
-    (_, curr_y) = obj["history"][-1]
-    return prev_y > line_y and curr_y <= line_y
+        MAX_LIFESPAN_MISS = max(1, int(self.BASE_MAX_LIFESPAN_MISS * fps_factor))
+        MIN_AGE_TO_COUNT = max(1, int(self.BASE_MIN_AGE_TO_COUNT * fps_factor))
 
+        back_sub = cv2.createBackgroundSubtractorMOG2(
+            history=int(500 * fps_factor),
+            varThreshold=50,
+            detectShadows=True
+        )
 
-# =========================================================
-# MAIN
-# =========================================================
-cap = cv2.VideoCapture(video_path)
+        tracked_objects = {}
+        next_id = 0
+        vehicle_count = 0
+        frame_idx = 0
 
-back_sub = cv2.createBackgroundSubtractorMOG2(
-    history=500,
-    varThreshold=16,
-    detectShadows=True
-)
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+            h, w, _ = frame.shape
+            frame_area = h * w
+            count_line_y = int(h * self.COUNT_LINE_Y_RATIO)
 
-tracked_objects = {}
-next_id = 0
-vehicle_count = 0
-frame_count = 0
-count_line_y = None
+            # Adaptive morphology kernel
+            k_w = max(3, int(w * 0.005))
+            k_h = max(15, int(h * 0.03))
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_w, k_h))
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+            # --- Background subtraction ---
+            lr = 1.0 if frame_idx == 0 else (0.005 / fps_factor)
+            fg_mask = back_sub.apply(frame, learningRate=lr)
+            _, fg_mask = cv2.threshold(fg_mask, 250, 255, cv2.THRESH_BINARY)
+            fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
 
-    # ---------- Background subtraction ----------
-    fg_mask = back_sub.apply(frame)
-    _, fg_only = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
-
-    # ---------- Morphology ----------
-    fg_opened = cv2.morphologyEx(fg_only, cv2.MORPH_OPEN, kernel_open)
-    fg_clean = cv2.morphologyEx(fg_opened, cv2.MORPH_CLOSE, kernel_close)
-
-    h, w = fg_clean.shape
-    frame_area = h * w
-
-    if count_line_y is None:
-        count_line_y = int(COUNT_LINE_Y_RATIO * h)
-    exit_zone_y = int(EXIT_ZONE_Y_RATIO * h)
-
-    # ---------- ROI ----------
-    roi_mask = np.zeros((h, w), dtype=np.uint8)
-    roi_mask[int(0.05*h):h, int(0.05*w):int(0.95*w)] = 255
-    fg_roi = cv2.bitwise_and(fg_clean, fg_clean, mask=roi_mask)
-
-    # ---------- Contours ----------
-    contours, _ = cv2.findContours(
-        fg_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    current_centroids = []
-
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < 200 or area > 0.20 * frame_area:
-            continue
-
-        x, y, cw, ch = cv2.boundingRect(cnt)
-        if ch > 0.7 * h:
-            continue
-
-        if cw / float(ch) < 0.3:
-            continue
-
-        cx = x + cw // 2
-        cy = y + ch // 2
-        current_centroids.append((cx, cy))
-
-    # ---------- Tracking ----------
-    updated_objects = {}
-
-    for cx, cy in current_centroids:
-        matched_id = None
-        best_score = float("inf")
-
-        for obj_id, obj in tracked_objects.items():
-            ox, oy = obj["centroid"]
-
-            # direction consistency
-            if cy > oy + 10:
-                continue
-
-            dist = np.hypot(cx - ox, cy - oy)
-            dist_thresh = BASE_MAX_DISTANCE
-            if oy > 0.7 * h:
-                dist_thresh *= NEAR_CAMERA_BOOST
-
-            if dist > dist_thresh:
-                continue
-
-            score = dist - 0.1 * obj["age"]
-            if score < best_score:
-                best_score = score
-                matched_id = obj_id
-
-        if matched_id is not None:
-            obj = tracked_objects[matched_id]
-            obj["centroid"] = (cx, cy)
-            obj["last_seen"] = frame_count
-            obj["age"] += 1
-            obj["history"].append((cx, cy))
-            updated_objects[matched_id] = obj
-        else:
-            updated_objects[next_id] = {
-                "id": next_id,
-                "centroid": (cx, cy),
-                "last_seen": frame_count,
-                "age": 1,
-                "counted": False,
-                "history": [(cx, cy)]
-            }
-            next_id += 1
-
-    for obj_id, obj in tracked_objects.items():
-        if frame_count - obj["last_seen"] <= MAX_MISSING:
-            updated_objects[obj_id] = obj
-
-    tracked_objects = updated_objects
-
-    # ---------- Counting ----------
-    for obj in tracked_objects.values():
-        if not is_valid_vehicle(obj):
-            continue
-        if not obj["counted"] and crossed_line(obj, count_line_y):
-            vehicle_count += 1
-            obj["counted"] = True
-        if not obj["counted"]:
-            # Normal line crossing
-            if crossed_line(obj, count_line_y):
-                vehicle_count += 1
-                obj["counted"] = True
-
-            # Exit-zone counting (for trucks & edge cases)
-            elif obj["centroid"][1] < exit_zone_y:
-                vehicle_count += 1
-                obj["counted"] = True
-
-    # ---------- Visualization ----------
-    if frame_count % VIS_EVERY_N_FRAMES == 0:
-        vis = frame.copy()
-
-        # counting line
-        cv2.line(vis, (0, count_line_y), (w, count_line_y), (255, 0, 0), 2)
-
-        for obj in tracked_objects.values():
-            if not is_valid_vehicle(obj):
-                continue
-
-            cx, cy = obj["centroid"]
-            label = f"ID {obj['id']}"
-            if obj["counted"]:
-                label += " ✓"
-
-            cv2.circle(vis, (cx, cy), 5, (0, 0, 255), -1)
-            cv2.putText(
-                vis, label, (cx + 5, cy - 5),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2
+            # --- Contour extraction ---
+            contours, _ = cv2.findContours(
+                fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
 
-        plt.figure(figsize=(10,4))
-        plt.title(f"Frame {frame_count} | Total Count: {vehicle_count}")
-        plt.imshow(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
-        plt.axis("off")
-        plt.show()
+            current_centroids = []
 
-    frame_count += 1
+            for cnt in contours:
+                x, y, cw, ch = cv2.boundingRect(cnt)
+                area = cv2.contourArea(cnt)
 
-cap.release()
+                perspective_factor = 0.2 + 0.8 * (y / h)
+                if area < frame_area * self.MIN_AREA_RATIO * perspective_factor:
+                    continue
+                if (cw / ch) < self.MIN_ASPECT_RATIO:
+                    continue
 
-print("\n==============================")
-print("FINAL VEHICLE COUNT:", vehicle_count)
-print("==============================")
+                current_centroids.append((x + cw // 2, y + ch // 2))
+
+            # --- Tracking ---
+            new_tracked = {}
+            search_dist = int(h * self.BASE_SEARCH_DIST_RATIO / fps_factor)
+
+            for cx, cy in current_centroids:
+                best_id = None
+                min_dist = search_dist
+
+                for obj_id, data in tracked_objects.items():
+                    px, py = data["history"][-1]
+                    dist = np.hypot(cx - px, cy - py)
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_id = obj_id
+
+                if best_id is not None:
+                    data = tracked_objects.pop(best_id)
+                    data["history"].append((cx, cy))
+                    data["age"] += 1
+                    data["lost"] = 0
+                    new_tracked[best_id] = data
+                else:
+                    new_tracked[next_id] = {
+                        "history": [(cx, cy)],
+                        "age": 1,
+                        "counted": False,
+                        "lost": 0
+                    }
+                    next_id += 1
+
+            for obj_id, data in tracked_objects.items():
+                if data["lost"] < MAX_LIFESPAN_MISS:
+                    data["lost"] += 1
+                    new_tracked[obj_id] = data
+
+            tracked_objects = new_tracked
+
+            # --- Counting (direction-agnostic with hysteresis) ---
+            LINE_TOL = max(3, int(0.005 * h))
+
+            for data in tracked_objects.values():
+                if data["counted"]:
+                    continue
+                if data["age"] < MIN_AGE_TO_COUNT:
+                    continue
+                if len(data["history"]) < 2:
+                    continue
+
+                y_prev = data["history"][-2][1]
+                y_curr = data["history"][-1][1]
+
+                prev_dist = y_prev - count_line_y
+                curr_dist = y_curr - count_line_y
+
+                crossed = (
+                    (prev_dist > LINE_TOL and curr_dist < -LINE_TOL) or
+                    (prev_dist < -LINE_TOL and curr_dist > LINE_TOL)
+                )
+
+                if crossed:
+                    vehicle_count += 1
+                    data["counted"] = True
+
+            frame_idx += 1
+
+        cap.release()
+        return vehicle_count
