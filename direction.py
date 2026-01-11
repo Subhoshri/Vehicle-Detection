@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 # =========================================================
 # CONFIGURATION
 # =========================================================
-VIDEO_PATH = "/kaggle/input/vehant-vehicle-camera-dataset/Dataset/vehant_hackathon_video_6.avi"
+VIDEO_PATH = "/kaggle/input/vehant/Dataset/vehant_hackathon_video_11.mp4"
 MIN_AREA_RATIO = 0.0012
 MIN_ASPECT_RATIO = 0.7
 
@@ -18,22 +18,10 @@ BASE_SEARCH_DIST_RATIO = 0.12  # ratio of frame height
 COUNT_LINE_Y_RATIO = 0.60
 VIS_INTERVAL = 20   # visualization interval (in frames)
 
-def infer_direction(history, min_frames=4):
-    if len(history) < min_frames:
-        return None
-
-    dy = history[-1][1] - history[0][1]
-
-    if abs(dy) < 5:   # too little movement
-        return None
-
-    return 1 if dy > 0 else -1
-
 # =========================================================
 # INITIALIZATION
 # =========================================================
 cap = cv2.VideoCapture(VIDEO_PATH)
-assert cap.isOpened(), f"Cannot open video: {VIDEO_PATH}"
 
 # Get actual FPS from video
 actual_fps = cap.get(cv2.CAP_PROP_FPS)
@@ -138,8 +126,7 @@ while cap.isOpened():
                 "history": [(cx, cy)],
                 "age": 1,
                 "counted": False,
-                "lost": 0,
-                "direction": None,   # +1 = down, -1 = up
+                "lost": 0
             }
             next_id += 1
 
@@ -152,26 +139,16 @@ while cap.isOpened():
     tracked_objects = new_tracked
 
     # -----------------------------------------------------
-    # COUNTING (direction-agnostic, single count per object)
+    # 4. Counting
     # -----------------------------------------------------
     for data in tracked_objects.values():
-
-        if data["counted"]:
-            continue
-
-        if data["age"] < MIN_AGE_TO_COUNT:
-            continue
-
-        if len(data["history"]) < 2:
-            continue
-
-        y_prev = data["history"][-2][1]
-        y_curr = data["history"][-1][1]
-
-        # direction-agnostic crossing
-        if (y_prev - count_line_y) * (y_curr - count_line_y) < 0:
-            vehicle_count += 1
-            data["counted"] = True
+        if not data["counted"] and data["age"] >= MIN_AGE_TO_COUNT:
+            if len(data["history"]) >= 2:
+                py_prev = data["history"][-2][1]
+                py_curr = data["history"][-1][1]
+                if (py_prev - count_line_y) * (py_curr - count_line_y) < 0:
+                    vehicle_count += 1
+                    data["counted"] = True
 
     # -----------------------------------------------------
     # 5. VISUALIZATION (EVERY N FRAMES)
